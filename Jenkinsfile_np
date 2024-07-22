@@ -1,0 +1,703 @@
+/*******************************************************************************
+    This pipeline will build and push the container to the sandbox
+    Author: Balabhshek Sureddi
+**********************************************************************************/
+def colorCode = '#FFFF00'
+def shiftleft  = "true"
+def codelang
+def jver 
+
+def appendFile(String fileName, String line) {
+    def current = ""
+    if (fileExists(fileName)) {
+        current = readFile fileName
+    }
+    writeFile file: fileName, text: current + "\n" + line
+}
+
+ 
+
+def sendVariables(String status){
+
+   sh """    
+        set -x
+        echo Archiving ${status} build
+        echo build_date=`date` > ${env.BUILD_NUMBER}.tmp  
+        env|sort >>  ${env.BUILD_NUMBER}.tmp
+        cat ${env.BUILD_NUMBER}.tmp|sort|uniq > ${env.BUILD_NUMBER}.properties
+        wget --no-check-certificate -O consoleText ${BUILD_URL}consoleText && gsutil mv consoleText gs://np-ca-merch-dummy-bucket/jenkins_build_logs/${status}/${params.NameSpace}_${params.ApplicationName}_${params.Environment}_${env.BUILD_NUMBER}.log      
+        gsutil cp ${env.BUILD_NUMBER}.properties  gs://np-ca-merch-dummy-bucket/jenkins_build_logs/${status}/${params.NameSpace}_${params.ApplicationName}_${params.Environment}_${env.BUILD_NUMBER}.properties
+        echo "getting configmap"
+        wget --no-check-certificate -O configmap https://config.dev-merch.homedepot.ca/map/${params.NameSpace}/merch-${params.ApplicationName}-${params.ApplicationName}-env || true 
+        cat configmap | python -m json.tool > configmap_pretty
+        #cat configmap_pretty
+        echo "copying configmap"
+        gsutil cp configmap_pretty gs://np-ca-merch-dummy-bucket/jenkins_build_logs/${status}/${params.NameSpace}_${params.ApplicationName}_${params.Environment}_${env.BUILD_NUMBER}.configmap    
+        
+    """
+    
+}
+
+def createDiff(type, status){
+	sh """
+		cp "${DIR_DEVOPS}"/scripts/get_repo_changes.py .
+		cp "${DIR_DEVOPS}"/scripts/JenkinsLog.py .
+		python3 -u get_repo_changes.py gs://np-ca-merch-dummy-bucket/jenkins_build_logs/${status}/"${params.NameSpace}"_"${params.ApplicationName}"_"${params.Environment}"_"${env.BUILD_NUMBER}".log ${type} > getdiff.sh 2>/dev/null|| true
+		#cat getdiff.sh
+		if [ -s getdiff.sh ]; then 
+            cat getdiff.sh > charts.diff
+			bash getdiff.sh > charts.diff || true
+			if [ -s charts.diff ]; then
+				#cat charts.diff
+				gsutil mv charts.diff  gs://np-ca-merch-dummy-bucket/jenkins_build_logs/${status}/"${params.NameSpace}"_"${params.ApplicationName}"_"${params.Environment}"_"${env.BUILD_NUMBER}"_${type}.diff
+			else
+				echo "No ${type} diff to send."
+			fi
+		else
+			echo "No difference in ${type} code."
+		fi
+	"""
+	
+}
+
+def publishReport(status){
+	sh """
+		cp "${DIR_DEVOPS}"/scripts/JenkinsLog.py .
+		cp "${DIR_DEVOPS}"/scripts/create_jenkins_report.py .
+		mkdir ./templates || true
+		cp  "${DIR_DEVOPS}"/scripts/templates/* templates/
+ 		python3 -u  create_jenkins_report.py gs://np-ca-merch-dummy-bucket/jenkins_build_logs/${status}/"${params.NameSpace}"_"${params.ApplicationName}"_"${params.Environment}"_"${env.BUILD_NUMBER}".log  2>&1|grep 'See debug information report: '|| true
+	"""
+	
+}
+
+pipeline {
+    agent { label 'ubuntu-22' }
+    parameters {
+       string(name: 'branch', defaultValue: 'canary', description: 'branch name')
+       string(name: 'NameSpace', defaultValue: 'promotions', description: 'NameSpace')
+       string(name: 'ApplicationName', defaultValue: 'promotion-notification-service', description: 'name of the application')
+       string(name: 'projectId', defaultValue: 'np-ca-merch', description: 'name of the project')
+       string(name: 'cluster', defaultValue: 'merch-dev', description: 'In which cluster the chart to be deployed')
+       string(name: 'Environment', defaultValue: 'dev', description: 'Environment to be deployed into')
+       string(name: 'slackChannel', defaultValue: '#ca_merch_cicd_alerts_dev', description: 'slack channel name for alerts')
+       string(name: 'project_config', defaultValue: 'np-ca-merch', description: 'Give the project config location')
+    }
+    environment{
+       DIR_DEVOPS                     = "${WORKSPACE}/devops"
+       DIR_APP                        = "${WORKSPACE}/${ApplicationName}"
+       DIR_Charts                     = "${WORKSPACE}/charts"
+       /**************************Configs for the Application**********************************/
+       def config                     = readYaml file: "${project_config}/microservices/config-${NameSpace}.yaml"
+       def configGlobal             = readYaml file: "${projectId}/microservices/config-${NameSpace}.yaml"
+       def config_cluster             = readYaml file: "${projectId}/microservices/config-${cluster}.yaml"
+       gitUrl                         = config.get(NameSpace).get(ApplicationName).get("srcrepo")
+       sonarQube_Boolean              = config.get(NameSpace).get(ApplicationName).get("sonarqube")
+       startClass                     = config.get(NameSpace).get(ApplicationName).get("mainClass")
+       jdkversion                      = config.get(NameSpace).get(ApplicationName).get("javaVersion")
+       nodeversion                    = config.get(NameSpace).get(ApplicationName).get("nodeVersion") 
+       buildcmd                       = config.get(NameSpace).get(ApplicationName).get("buildcmd")
+       dockerfilePath                 = config.get(NameSpace).get(ApplicationName).get("DockerfilePath")
+       ChartsRepo                     = config.get(NameSpace).get(ApplicationName).get("ChartsRepo")
+       ChartsPath                     = config.get(NameSpace).get(ApplicationName).get("ChartsPath")
+       STR_EMAILID                    = config.get(NameSpace).get(ApplicationName).get("EmailList")
+       Swagger_Dir                    = config.get(NameSpace).get(ApplicationName).get("SwaggerDir")
+       sonar_host_url                 = config_cluster.get("global").get("sonarUrl")
+       application_url                = config_cluster.get("global").get("applicationUrl")
+       PATH                           = "/var/lib/jenkins/utils/google-cloud-sdk/bin:$PATH"
+    CLOUDSDK_ACTIVE_CONFIG_NAME    = "np-cadotcom-sandbox"
+    }
+   tools { 
+     maven 'maven 3.8'
+     jdk "jdk11"
+     gradle 'gradle 7.5'
+   }
+       /*****************************Enable Options*********************************************/     
+    options  {
+            timestamps()
+            buildDiscarder(logRotator(numToKeepStr: '100'))
+            disableResume()
+    }
+   stages {
+       /****************************Source Code Checkout******************************************/
+        stage('Checkout Source Code ') {
+             steps {
+                  script {
+                       cleanWs()
+               buildName "#${BUILD_NUMBER} : ${ApplicationName}-${params.Environment}"
+                       dir("${DIR_APP}"){
+                           git branch: "$branch", changelog: false, credentialsId: 'bitbucket_cloud' , poll: false, url: "$gitUrl"
+                      }    
+                     }
+                }
+            }
+
+      /****************************Devops Directory Checkout******************************************/
+      stage('Checkout Devops Repo') {
+            steps {
+
+                  script {
+                       dir("${DIR_DEVOPS}"){
+                       git branch: "master", changelog: false, credentialsId: 'svc_cicd_github' , poll: false, url: "https://github.com/one-thd/thdca-jenkins-ci.git" 
+                      }
+                     }
+                }
+            }
+
+      /****************************Chart Directory Checkout******************************************/
+     stage('Checkout Charts Repo') {
+             steps {
+                  script {
+                       dir("${DIR_Charts}"){
+                       git branch: "master", changelog: false, credentialsId: 'bitbucket_cloud' , poll: false, url: "${ChartsRepo}" 
+                      }
+                     }
+                }
+            }
+     /****************************Type of app******************************************/
+
+     stage('Application Type') {
+            steps {
+                dir("${DIR_APP}") {
+                    script {
+                        if (params.ApplicationName == 'promotions-web-portal') {
+                            codelang = 'node'
+                            jver = '11'
+                            echo "$codelang"
+                            echo "$jver"
+                        } else {
+                            if (fileExists('package.json')) {
+                                codelang = 'node'
+                                jver = '11'
+                            } else if (fileExists('apps/core-discount-service')) {
+                                codelang = 'java-pe-monorepo'
+                                jver = "$jdkversion"                      
+                            } else if (fileExists('pom.xml')) {
+                                codelang = 'java'
+                                jver = "$jdkversion"
+                            } else if (fileExists('build.gradle')) {
+                                codelang = 'gradle'
+                                jver = "$jdkversion"
+                            } else if (fileExists('service/requirements.txt'))  {
+                                codelang = 'python'
+                                jver = '11'
+                            } else if (fileExists('backend/onboarding/requirements.txt')) {
+                                codelang = 'python'
+                                jver = '11'
+                            } else if (fileExists('backend/inbound/requirements.txt')) {
+                                codelang = 'python'
+                                jver = '11'
+                            } else if (fileExists('backend/bucketadapter/requirements.txt')) {
+                                codelang = 'python'
+                                jver = '11'
+                            } else if (fileExists('batch/requirements.txt')) {
+                                codelang = 'python'
+                                jver = '11'
+                            } else {
+                                echo "No Language Detected"
+                                return
+                            }
+                        }
+
+                        echo "$codelang"
+                        echo "$jver"
+                    }
+                }
+            }
+        }   
+
+
+
+       /****************************Slack Notification******************************************/
+        stage('Pre Notify Channel'){
+                steps {
+                        slackSend color:colorCode, channel: slackChannel, message: "Starting build and deployment of  ${params.NameSpace}  - ${params.ApplicationName} in  ${params.Environment}  - ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|See progress>)"
+                }
+            } 
+
+    /**********************************Build ***************************************/        
+        stage('Build'){
+   
+      
+     // def jver = sh (script: "if [[ '$jdkversion' == 'null' ]]; then [[ '$jdkversion' == '$jversion' ]]; else [[ '$jdkversion' == '$jdkversion' ]]; fi && echo $jdkversion" ,returnStdout: true).trim()
+        
+        tools {     
+            jdk "jdk$jver"        
+            }
+            steps { 
+                dir("${DIR_APP}"){
+                    script {
+                        if ( codelang == "java"){ 
+                           sh("cd apps/product-catalog-article-hierarchy-service || true")
+                           echo "java version........."
+                           sh 'java -version'
+                           echo "jdkversion:"
+                           echo "${jdkversion}"
+                         if ( "${jdkversion}" == "11"){
+                            echo "-----------------  Starting the Build --------------------"
+                          //  sh "mvn dependency:purge-local-repository -DreResolve=false"
+                            sh "mvn clean package -U com.google.cloud.tools:jib-maven-plugin:3.3.2:dockerBuild -Djib.from.image=gcr.io/distroless/java11:latest -Dimage=gcr.io/${projectId}/${NameSpace}-${ApplicationName} -Dhttps.proxyHost=thd-svr-proxy-qa.homedepot.com -Dhttps.proxyPort=7070 -Djib.container.mainClass=${startClass} -DcredHelper=gcr  -Djib.to.tags=2.0.${BUILD_NUMBER} -Djib.container.ports=8080 -Djib.console=plain -DproxySet=true -DproxyHost=thd-svr-proxy-qa.homedepot.com -DproxyPort=7070 -Dhttp.nonProxyHosts=*.homedepot.com -DnonProxyHosts=*.homdepot.com -DskipTests"
+                            sh "export MAVEN_OPTS='-Dhttp.proxyHost=thd-svr-proxy-qa.homedepot.com -Dhttp.proxyPort=7070 -Dhttps.proxyHost=thd-svr-proxy-qa.homedepot.com -Dhttps.proxyPort=7070'"
+                            }
+                        else if ( "${jdkversion}" == "17") {
+                            // sh "mvn dependency:purge-local-repository -DreResolve=false"
+                            sh "mvn clean package -U com.google.cloud.tools:jib-maven-plugin:3.3.2:dockerBuild -Djib.from.image=gcr.io/distroless/java17:latest -Dimage=gcr.io/${projectId}/${NameSpace}-${ApplicationName} -Dhttps.proxyHost=thd-svr-proxy-qa.homedepot.com -Dhttps.proxyPort=7070 -Djib.container.mainClass=${startClass} -DcredHelper=gcr  -Djib.to.tags=2.0.${BUILD_NUMBER} -Djib.container.ports=8080 -Djib.console=plain -DproxySet=true -DproxyHost=thd-svr-proxy-qa.homedepot.com -DproxyPort=7070 -Dhttp.nonProxyHosts=*.homedepot.com -DnonProxyHosts=*.homdepot.com -DskipTests"
+                           sh "export MAVEN_OPTS='-Dhttp.proxyHost=thd-svr-proxy-qa.homedepot.com -Dhttp.proxyPort=7070 -Dhttps.proxyHost=thd-svr-proxy-qa.homedepot.com -Dhttps.proxyPort=7070'"
+                            }
+                    }
+
+                        if ( codelang == "java-pe-monorepo"){ 
+                           echo "java version........."
+                           sh 'java -version'
+                           echo "jdkversion:"
+                           echo "${jdkversion}"
+                         if ( "${jdkversion}" == "11"){
+                            echo "-----------------  Starting the Build --------------------"
+                          //  sh "mvn dependency:purge-local-repository -DreResolve=false"
+                            sh "mvn clean package com.google.cloud.tools:jib-maven-plugin:3.3.2:dockerBuild -Djib.from.image=gcr.io/distroless/java11:latest -Dimage=gcr.io/${projectId}/${NameSpace}-${ApplicationName} -Dhttps.proxyHost=thd-svr-proxy-qa.homedepot.com -Dhttps.proxyPort=7070 -Djib.container.mainClass=${startClass} -DcredHelper=gcr  -Djib.to.tags=2.0.${BUILD_NUMBER} -Djib.container.ports=8080 -Djib.console=plain -DproxySet=true -DproxyHost=thd-svr-proxy-qa.homedepot.com -DproxyPort=7070 -Dhttp.nonProxyHosts=*.homedepot.com -DnonProxyHosts=*.homdepot.com -DskipTests"
+                            sh "export MAVEN_OPTS='-Dhttp.proxyHost=thd-svr-proxy-qa.homedepot.com -Dhttp.proxyPort=7070 -Dhttps.proxyHost=thd-svr-proxy-qa.homedepot.com -Dhttps.proxyPort=7070'"
+                            }
+                        else if ( "${jdkversion}" == "17") {
+                            sh "cd apps/core-discount-service"
+                            sh "pwd"
+                            sh "ls"
+                           // sh "mvn dependency:purge-local-repository -DreResolve=false"
+                            sh '''
+                            #cd apps/core-discount-service
+                            if [ "${ApplicationName}" = "promotions-barcode-deactivation-worker" ]; then
+                                pwd
+                                cd apps/promotions-status-worker
+                            else
+                               cd apps/"${ApplicationName}"
+                            fi
+                            
+                            pwd
+                            mvn clean package -U com.google.cloud.tools:jib-maven-plugin:3.3.2:dockerBuild -Djib.from.image=gcr.io/distroless/java17:latest -Dimage=gcr.io/${projectId}/${NameSpace}-${ApplicationName} -Dhttps.proxyHost=thd-svr-proxy-qa.homedepot.com -Dhttps.proxyPort=7070 -Djib.container.mainClass=${startClass} -DcredHelper=gcr  -Djib.to.tags=2.0.${BUILD_NUMBER} -Djib.container.ports=8080 -Djib.console=plain -DproxySet=true -DproxyHost=thd-svr-proxy-qa.homedepot.com -DproxyPort=7070 -Dhttp.nonProxyHosts=*.homedepot.com -DnonProxyHosts=*.homdepot.com -DskipTests
+                            export MAVEN_OPTS='-Dhttp.proxyHost=thd-svr-proxy-qa.homedepot.com -Dhttp.proxyPort=7070 -Dhttps.proxyHost=thd-svr-proxy-qa.homedepot.com -Dhttps.proxyPort=7070'
+                            
+                            '''
+                            }
+                    }
+                        else if ( codelang == "gradle"){ 
+                           echo "java version........."
+                           sh 'java -version'
+                           sh 'gradle -version'
+                         if ( "${jdkversion}" == "17"){
+                            echo "-----------------  Starting the Build (gradle, jdk 17)--------------------"
+
+                            sh "mkdir build"
+                            sh "touch jib-image.id"
+                            sh "touch jib-image.digest"
+                            sh "touch jib-image.json"
+
+                            sh "gradle jib -Djib.to.image=gcr.io/${projectId}/${NameSpace}-${ApplicationName}   -Djib.from.image=gcr.io/distroless/java17-debian11:latest  -Dhttps.proxyHost=thd-svr-proxy-qa.homedepot.com -Dhttps.proxyPort=7070  -DcredHelper=gcr  -Djib.to.tags=2.0.${BUILD_NUMBER} -Djib.container.ports=8080 -Djib.console=plain -DproxySet=true -DproxyHost=thd-svr-proxy-qa.homedepot.com -DproxyPort=7070 -Dhttp.nonProxyHosts=*.homedepot.com -DnonProxyHosts=*.homdepot.com -DskipTests"
+                            sh "export MAVEN_OPTS='-Dhttp.proxyHost=thd-svr-proxy-qa.homedepot.com -Dhttp.proxyPort=7070 -Dhttps.proxyHost=thd-svr-proxy-qa.homedepot.com -Dhttps.proxyPort=7070'"
+                         } else {
+                              echo "JDK 17 not detetcted"
+                         }
+                                             
+                        
+                    }
+                    else if ( codelang == "node"){
+                       
+                            sh '''
+                                export NVM_DIR="/opt/thdca/tools/nvm"
+                                [ -s "$NVM_DIR/nvm.sh" ] && \\. "$NVM_DIR/nvm.sh"  # This loads nvm
+                                
+                                export HTTP_PROXY=http://thd-svr-proxy-qa.homedepot.com:7070/
+                                export HTTPS_PROXY=http://thd-svr-proxy-qa.homedepot.com:7070/
+                                nvm install ${nodeversion}
+                                nvm use ${nodeversion}
+                                node --version
+                                npm install  
+                                if [ "${ApplicationName}" = "assortment-planning-frontend" ]; then 
+                                    echo "assortment-planning-frontend"
+                                    npm install -g @angular/cli@14.2.1
+                                    if [ "${Environment}" = "prod" ]; then
+                                        ng build --configuration=pr
+                                    else
+                                        $buildcmd$Environment
+                                    fi
+                                    cd dist/app
+                                elif [ "${ApplicationName}" = "fe-rms" ]; then 
+                                    echo "building fe-rms"
+                                        npm install -g @angular/cli
+                                        echo "$Environment"
+                                    npm run build:prod            
+                                elif [ "${ApplicationName}" = "promotions-web-portal" ]; then 
+                                    echo "building promotions-web-portal"
+                                        
+                                        echo "$Environment"
+                                        cd ui/promotions-web-portal
+                                        npm install
+                                        npm i @angular/cli@12.2.17
+                                    npm run build-$Environment 
+                                elif [ "${ApplicationName}" = "web-portal" ]; then 
+                                    echo "building web-portal"
+                                        echo "$Environment"
+                                        npm install
+                                        npm i @angular/cli@12.2.1
+                                        if [ "${Environment}" = "prod" ]; then
+                                          npm run build
+                                        else
+                                          npm run build-$Environment
+                                        fi
+
+                                     
+                                else  
+                                    echo "not assortment-planning-frontend"
+                                    npm install -g @angular/cli
+                                    echo "$Environment"
+                                    $buildcmd$Environment
+                                    
+                                fi
+                                
+                                if [ "${ApplicationName}" = "assortment-planning-nodejs_DISABLED" ]; then 
+                                    cd app-portal
+                                    echo "new install dir"
+                                    pwd
+                                    npm install
+                                    ng build
+                                    cd ..
+                                    #cp -R app-portal/dist/app-portal/* ./
+                                fi
+                                
+                                cp  $DIR_DEVOPS/${projectId}/microservices/Dockerfiles/${ApplicationName}/* . || true
+                                rm -rf ${DIR_APP}/.gitignore
+                                ls -ltra
+                                tar -cvzf code.tgz *
+
+                                echo "Preparing Docker Image"
+                                export HTTP_PROXY=http://thd-svr-proxy-qa.homedepot.com:7070 && export HTTPS_PROXY=http://thd-svr-proxy-qa.homedepot.com:7070 && export http_proxy=http://thd-svr-proxy-qa.homedepot.com:7070 && export https_proxy=http://thd-svr-proxy-qa.homedepot.com:7070 && gcloud builds submit --tag gcr.io/${projectId}/${NameSpace}-${ApplicationName}:2.0.${BUILD_NUMBER} code.tgz --timeout=1800s --project=${projectId}
+
+                              '''
+                        
+                    }
+
+                        else if ( codelang == "python"){
+                       
+                            sh '''
+                                set -x
+                                cp  ${dockerfilePath} .
+                                cat Dockerfile
+      
+                                rm -rf ${DIR_APP}/.gitignore
+                                ls -ltra
+                                tar -cvzf code.tgz *
+
+                                echo "Preparing Docker Image"
+                                export HTTP_PROXY=http://thd-svr-proxy-qa.homedepot.com:7070 && export HTTPS_PROXY=http://thd-svr-proxy-qa.homedepot.com:7070 && export http_proxy=http://thd-svr-proxy-qa.homedepot.com:7070 && export https_proxy=http://thd-svr-proxy-qa.homedepot.com:7070 && gcloud builds submit --tag gcr.io/${projectId}/${NameSpace}-${ApplicationName}:2.0.${BUILD_NUMBER} code.tgz --timeout=1800s --project=${projectId}
+
+                              '''
+                        
+                    }
+
+                   }
+                }
+            }
+        }   
+        /***********************************Sonar Analysis********************************************/
+        stage('Sonar Analysis'){
+             when{
+          expression {
+            codelang == "java"
+          }
+        }
+      tools {     
+            jdk "jdk$jver"        
+            }
+            steps {
+                dir("$DIR_APP"){ 
+                    script {
+                            if ( "${jdkversion}" == "17"){
+								sh 'sh  $DIR_DEVOPS/scripts/jdk17_updatePom_ubuntu22.sh "${DIR_APP}"'
+							}
+							else {
+							sh 'sh  $DIR_DEVOPS/scripts/updatePom_ubuntu22.sh "${DIR_APP}"'
+							}
+                           // updating JaCoCo version 
+                           sh '''
+                           sed -i 's/0.8.2/0.8.8/' pom.xml
+                           '''
+                           
+                            if ( "${sonarQube_Boolean}" == "true"){     
+
+                                    withCredentials([string(credentialsId: "sonar_password", variable: 'SONAR_PASSWORD'),string(credentialsId: "sonar_user", variable: 'SONAR_USER')]) {                        
+                                    echo "Running SonarQube (sonarQube_Boolean: ${sonarQube_Boolean})........."
+                                    sh "mvn clean test -Dsonar.projectName=${NameSpace}-${ApplicationName}-${cluster} -Dsonar.projectKey=${NameSpace}-${ApplicationName}-${cluster} -Dsonar.login=${SONAR_USER} -Dsonar.password=${SONAR_PASSWORD} -Dsonar.host.url=${sonar_host_url} -Dsonar.userHome=/opt/thdca/tools/sonar-scanner -Dsonar.sources=src/main -Dsonar.tests=src/test -Dsonar.coverage.jacoco.xmlReportPaths=target/jacoco-report/jacoco.xml -Dsonar.java.coveragePlugin=jacoco -Dsonar.language=java -Dmaven sonar:sonar -Dhttps.proxyHost=thd-svr-proxy-qa.homedepot.com -Dhttps.proxyPort=7070 -Dmaven.test.failure.ignore=true -Dsonar.buildbreaker.skip=false -DproxySet=true -DproxyHost=thd-svr-proxy-qa.homedepot.com -DproxyPort=7070 -Dhttp.nonProxyHosts=*.homedepot.com -DnonProxyHosts=*.homedepot.com"
+                                }  
+                            }
+                    }
+                }                 
+            }
+        }
+       /**********************************Validate Quality Gate***************************************/
+        stage('Build Breaker'){
+            steps { 
+                dir("${DIR_DEVOPS}"){
+                    script {
+                      if ( "${sonarQube_Boolean}" == "true"){
+                         echo "Validate Quality Gate........."
+                        // sh 'python3 -u $DIR_DEVOPS/scripts/Sonarqube.py "${DIR_APP}"'
+                        }                   
+                   }
+                }   
+            }
+        }
+         
+       /**********************************Docker Image push***************************************/        
+        stage('Push Docker Image'){
+            steps { 
+                dir("${DIR_APP}"){
+                    script {
+                        if ( "${codelang}" == "java"){
+                          sh "docker push gcr.io/${projectId}/${NameSpace}-${ApplicationName}:2.0.${BUILD_NUMBER} "
+                          appendFile("message.txt" , "Chart name :- gcr.io/${projectId}/${NameSpace}-${ApplicationName}:2.0.${BUILD_NUMBER} ")
+                        }
+                        else if ( "${codelang}" == "java-pe-monorepo"){
+                          sh "docker  push gcr.io/${projectId}/${NameSpace}-${ApplicationName}:2.0.${BUILD_NUMBER} "
+                          appendFile("message.txt" , "Chart name :- gcr.io/${projectId}/${NameSpace}-${ApplicationName}:2.0.${BUILD_NUMBER} ")
+                        }
+                       else if ( "${codelang}" == "gradle"){
+                          sh "docker  pull gcr.io/${projectId}/${NameSpace}-${ApplicationName}:2.0.${BUILD_NUMBER} "
+                          appendFile("message.txt" , "Chart name :- gcr.io/${projectId}/${NameSpace}-${ApplicationName}:2.0.${BUILD_NUMBER} ")
+                        }
+                       else if ( "${codelang}" == "python"){
+                          sh "docker pull gcr.io/${projectId}/${NameSpace}-${ApplicationName}:2.0.${BUILD_NUMBER} "
+                          appendFile("message.txt" , "Chart name :- gcr.io/${projectId}/${NameSpace}-${ApplicationName}:2.0.${BUILD_NUMBER} ")
+                        }
+                       else if ( "${codelang}" == "node"){
+                          sh "docker pull gcr.io/${projectId}/${NameSpace}-${ApplicationName}:2.0.${BUILD_NUMBER} "
+                          appendFile("message.txt" , "Chart name :- gcr.io/${projectId}/${NameSpace}-${ApplicationName}:2.0.${BUILD_NUMBER} ")
+                        }
+                    }
+                }
+            }
+        }
+        /**********************************Prisma scan***************************************/        
+/*        
+        stage('Prisma Scan'){
+            steps { 
+                 build  (job:'PrismaCloudScan' , parameters :[[$class: 'StringParameterValue', name: 'ImageName', value: "gcr.io/${projectId}/${NameSpace}-${ApplicationName}:2.0.${BUILD_NUMBER}"],[$class: 'StringParameterValue', name: 'BuildPath', value: "${DIR_APP}"]])
+            }
+        }
+*/
+        /**********************************Docker Remove Image***************************************/        
+        stage('Removing Docker Image'){
+            steps { 
+                dir("${DIR_APP}"){
+                    script {
+                          sh "docker rmi gcr.io/${projectId}/${NameSpace}-${ApplicationName}:2.0.${BUILD_NUMBER} "
+                    }
+                }
+            }
+        }
+       /**********************************Notify Channel***************************************/            
+        stage('Notify Channel'){
+                steps {
+                       script {
+                               colorCode = '#00FF00'  
+                       }
+                    slackSend color:colorCode, channel: slackChannel, message: "Build and Docker Image push of  ${params.NameSpace}  - ${params.ApplicationName} has been completed in  ${params.Environment}  - ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|See progress>)"                       
+                }
+            }
+       /**********************************Publish and Deploy Chart***************************************/
+        stage('Publish and Deploy Chart') {
+         steps {
+             build  (job:'np-ca-merch/Chart_Deployment/publish_chart' , parameters :[[$class: 'StringParameterValue', name: 'ChartsRepo', value: "${ChartsRepo}"],[$class: 'StringParameterValue', name: 'chartpath', value: "${ChartsPath}"],[$class: 'StringParameterValue', name: 'appversion', value: "2.0.${BUILD_NUMBER}"],[$class: 'StringParameterValue', name: 'projectId', value: "${params.projectId}"],[$class: 'StringParameterValue', name: 'service', value: "${ApplicationName}"],[$class: 'StringParameterValue', name: 'NameSpace', value: "${NameSpace}"],[$class: 'StringParameterValue', name: 'cluster', value: "${params.cluster}"],[$class: 'StringParameterValue', name: 'env', value: "${params.Environment}"],[$class: 'StringParameterValue', name: 'branch', value: "master"],[$class: 'StringParameterValue', name: 'branch', value: "master", name: 'slackChannel', value: "${slackChannel}"],[$class: 'StringParameterValue', name: 'project_config', value: "${project_config}"]])
+            }
+        }
+    // /***********************************Fortify Scan********************************************/       
+    //         stage('Fortify Scan') {
+    //             when{
+    //                 expression { 
+    //                  "${params.Environment}" == "qa"
+    //                            }
+    //                 }
+    //          steps{
+    //              dir("$DIR_APP") {
+    //                        sh "python3 -u $DIR_DEVOPS/scripts/Fortify.py ${DIR_APP} dev js ${FORITFY_TOKEN} ${STR_EMAILID}"
+    //                       }
+    //               }
+    //         }
+            
+        
+      /***********************************Shiftleft Scan********************************************/       
+                    
+            stage('Shiftleft Scan') {
+             when{
+                    expression { 
+                     "${shiftleft}" == "true"
+                               }
+                    }
+               steps { 
+                    script {
+                        prefix="Merch"
+                        
+                         if ( codelang == "java" || codelang == "gradle" ){
+                            build  (job:'Shiftleft' , parameters :[[$class: 'StringParameterValue', name: 'gitUrl', value: "$gitUrl"],[$class: 'StringParameterValue', name: 'branch', value: "$branch"],[$class: 'StringParameterValue', name: 'branch', value: "$branch"],[$class: 'StringParameterValue', name: 'AppName', value: "$prefix-${ApplicationName}"],[$class: 'StringParameterValue', name: 'Language', value: "Java${jdkversion}"]])
+                         }
+                         else if ( codelang == "python"){
+                            // build  (job:'Shiftleft' , parameters :[[$class: 'StringParameterValue', name: 'gitUrl', value: "$gitUrl"],[$class: 'StringParameterValue', name: 'branch', value: "$branch"],[$class: 'StringParameterValue', name: 'branch', value: "$branch"],[$class: 'StringParameterValue', name: 'AppName', value: "$prefix-${ApplicationName}"],[$class: 'StringParameterValue', name: 'Language', value: "Python"]])
+                            echo "PY shiftleft is skipped, have to fix this"
+                         }
+                         else if ( codelang == "node"){
+                            build  (job:'Shiftleft' , parameters :[[$class: 'StringParameterValue', name: 'gitUrl', value: "$gitUrl"],[$class: 'StringParameterValue', name: 'branch', value: "$branch"],[$class: 'StringParameterValue', name: 'branch', value: "$branch"],[$class: 'StringParameterValue', name: 'AppName', value: "$prefix-${ApplicationName}"],[$class: 'StringParameterValue', name: 'Language', value: "JavaScript"]])
+                         }
+                         else if ( codelang == "java-pe-monorepo"){
+                            def appName = ApplicationName == "promotions-barcode-deactivation-worker" ? "promotions-barcode-worker" : ApplicationName
+                            build  (job:'Shiftleft' , parameters :[[$class: 'StringParameterValue', name: 'gitUrl', value: "$gitUrl"],[$class: 'StringParameterValue', name: 'branch', value: "$branch"],[$class: 'StringParameterValue', name: 'branch', value: "$branch"],[$class: 'StringParameterValue', name: 'AppName', value: "$prefix-${appName}"],[$class: 'StringParameterValue', name: 'Language', value: "Java${jdkversion}"],[$class: 'StringParameterValue', name: 'FolderPath', value: "apps/${appName}"]])
+                         }
+               
+                    }
+                }
+            }
+            
+    /*******************************Metadata Validation*********************************************/
+           /* stage ('Metadata JSON') {
+                steps{
+                   dir("$DIR_APP") { 
+                     script { 
+                        if ( fileExists('pom.xml')) {
+                           if ( "${params.Environment}" == "dev" ) {
+                                SwaggerBucket="${env.SWAGGER_BUCKET_DEV}"
+                           }
+                           else if ( "${params.Environment}" == "qa" ) {
+                                SwaggerBucket="${env.SWAGGER_BUCKET_QA}"
+                           }                            
+                           else if ( "${params.Environment}" == "qp" ) {
+                                SwaggerBucket="${env.SWAGGER_BUCKET_QP}"
+                           }
+                           else { 
+                             echo "No variable defined for the environment"
+                           }
+                           if ( "${SwaggerBucket}" != "null") {
+                               sh "python3 -u $DIR_DEVOPS/scripts/swagger_bucket_push.py $DIR_APP $SwaggerBucket ${projectId} $NameSpace $ApplicationName $gitUrl"
+                          }
+                      }
+                  }
+              }
+         }  
+      } 
+     */
+      
+     /***********************************WebInspect Scan********************************************/       
+            stage('WebInspect Scan') {
+                when{
+                    expression { 
+                     "${params.Environment}" == "qa"
+                               }
+                    }
+             steps{
+                 dir("$DIR_APP") {
+                    script {
+                        if ( "${Swagger_Dir}" != "null"){ 
+                           echo "submit DAST"
+                           sh "python3 -u $DIR_DEVOPS/scripts/dast_submitList.py ${Swagger_Dir} ${FORITFY_TOKEN} ${application_url} ${STR_EMAILID} $DIR_APP"
+                          }
+                          else
+                          {
+                          appendFile("message.txt" , "DAST Submit :- No files submitted")
+                          }
+                         }
+                    }                         
+                  }
+              }    
+    
+    
+    /**********************************Publish Prod Charts**************************************/
+    stage('Publish prod changes') {
+                when{
+                    expression { 
+
+                     "${params.Environment}" == "qp"
+ 
+                      }
+                }
+             steps{
+                
+            script {
+
+                    withCredentials([string(credentialsId: "helm_user", variable: 'HELM_USER'),string(credentialsId: "helm_password", variable: 'HELM_PASSWORD')]) {    
+
+                    //  sh "cd $DIR_DEVOPS; python3 ${project_config}/chart_deployment/publish_chart/package_chart.py ${project_config}/microservices/config-${NameSpace}.yaml ${DIR_Charts}/${ChartsPath} ${Namespace} ${ApplicationName}  '2.0.${env.BUILD_NUMBER}' 'prod' ${projectId} ${HELM_USER} ${HELM_PASSWORD} ${HELM_URL}"
+                
+                        
+    
+                       }                         
+                  }
+              }    
+    } 
+   }
+       	 post {
+			success 
+	     {
+	          dir("$DIR_APP") {
+					script {
+				        sendVariables("success")
+						colorCode = '#2fba64' 
+						env.FILENAME = readFile 'message.txt'
+						echo "${env.FILENAME}"	
+						
+				    }
+					slackSend color:colorCode, channel: slackChannel, message: "Build and Security scan has been Completed   ${env.FILENAME}  "
+				}
+	     }	 
+          failure {
+		  dir("$DIR_APP") {
+				  script {
+				        colorCode = '#FF0000'
+						env.FILENAME = readFile 'message.txt'
+						echo "${env.FILENAME}"	
+
+				       }
+                slackSend color:colorCode, channel: slackChannel, message: "  ${params.NameSpace}  - ${params.ApplicationName} in  ${params.Environment}  - ${env.JOB_NAME} ${env.BUILD_NUMBER} has been Failed ${env.FILENAME} (<${env.BUILD_URL}| Please check logs>)"      
+         }
+		    
+		 		 
+		 }
+		 unsuccessful {
+		 
+		 dir("$DIR_APP") {
+				 script {										
+						sendVariables("unsuccessful")
+				 }
+               
+			}
+		 dir("$DIR_Charts") {
+				 script {										
+						createDiff("charts_repo", "unsuccessful")	
+				 }
+               
+			}
+			dir("$DIR_APP") {
+				 script {
+						createDiff("app_repo", "unsuccessful")							
+						
+				 }
+               
+			}		 
+			dir("$DIR_DEVOPS") {
+				 script {										
+                        			createDiff("jenkins_repo", "unsuccessful")
+                        			createDiff("configmap", "unsuccessful")
+						publishReport("unsuccessful")
+				 }
+               
+			}
+		 
+			dir("$DIR_APP") {
+				 script {
+						
+				        colorCode = '#FF0000'
+						env.FILENAME = readFile 'message.txt'
+						echo "${env.FILENAME}"
+										       }
+                slackSend color:colorCode, channel: slackChannel, message: "  ${params.NameSpace}  - ${params.ApplicationName} in  ${params.Environment}  - ${env.JOB_NAME} ${env.BUILD_NUMBER} ${env.FILENAME} has been unsuccessful .  (<${env.BUILD_URL} |Please check logs>)"  
+        
+			}
+		 
+		 }
+
+   }
+}
